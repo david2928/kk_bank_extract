@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+env/
+.venv/
+.env/
+
+# IDE / Editor specific
+.vscode/
+.idea/
+
+# Secrets and credentials - IMPORTANT!
+.env
+token.json
+credentials.json
+service_account.json
+# If you switch to a service account, you'll add its JSON key file name here too (e.g., service_account_key.json)
+
+# Downloaded files
+downloaded_reports/
+
+# Output files / logs (if any specific ones are generated and not needed in repo)
+# *.log
+
+# OS-specific
+.DS_Store
+Thumbs.db 

@@ -1,0 +1,47 @@
+name: K-Merchant Report Processing
+
+on:
+  push:
+    branches: [ main ] # Triggers on push to the main branch
+  workflow_dispatch: # Allows manual triggering from the Actions tab
+
+jobs:
+  process_reports:
+    runs-on: ubuntu-latest
+    env:
+      # These secrets need to be configured in your GitHub repository settings
+      # Settings > Secrets and variables > Actions > New repository secret
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+      ZIP_PASSWORD: ${{ secrets.ZIP_PASSWORD }}
+      GMAIL_USER_EMAIL: ${{ secrets.GMAIL_USER_EMAIL }} # Email to impersonate
+      GDRIVE_ROOT_FOLDER_ID: ${{ secrets.GDRIVE_ROOT_FOLDER_ID }}
+      ADMIN_EMAIL: ${{ secrets.ADMIN_EMAIL }}
+      # This secret will hold the content of your service_account.json
+      # The workflow will write it to a file.
+      # GOOGLE_SERVICE_ACCOUNT_KEY_PATH will be the path to this created file.
+      # By default, config.py expects 'service_account.json' in the project root.
+      GOOGLE_SERVICE_ACCOUNT_KEY_PATH: service_account.json
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11' # Specify your Python version
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Create Google Service Account Key File
+      # Writes the content of the GOOGLE_SERVICE_ACCOUNT_KEY_JSON secret 
+      # to the file specified by env.GOOGLE_SERVICE_ACCOUNT_KEY_PATH
+      run: echo "${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY_JSON }}" > ${{ env.GOOGLE_SERVICE_ACCOUNT_KEY_PATH }}
+      shell: bash # Ensure bash is used for echo with quotes
+
+    - name: Run K-Merchant Report Processor
+      run: python -m src.main 
