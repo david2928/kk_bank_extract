@@ -1,13 +1,16 @@
-# K-Merchant Fee Extract
+# KBank Email Report Processing System
 
-Automated system for processing K-Merchant email reports, extracting CSV data, loading it into Supabase, and archiving files to Google Drive.
+Automated system for processing K-Merchant and KBank eWallet email reports, extracting relevant data, loading it into Supabase, and archiving files to Google Drive.
 
 ## Features
-- Fetches K-Merchant report emails from Gmail (using a service account)
-- Downloads and extracts ZIP attachments containing CSVs
-- Loads extracted data into a Supabase database
-- Uploads original and extracted files to Google Drive, organized by Year/Month/Day
-- Runs automatically via GitHub Actions (scheduled or manual)
+- Fetches K-Merchant report emails (ZIP attachments with CSVs) and KBank eWallet report emails (CSVs and PDFs) from Gmail using a service account.
+- Downloads and extracts K-Merchant ZIP attachments.
+- Processes K-Merchant CSVs: extracts transaction summary data.
+- Processes KBank eWallet CSVs: extracts 'MERCHANT TOTAL' row data.
+- Loads extracted data from both K-Merchant and eWallet CSVs into a Supabase database, distinguishing them by `report_source_type`.
+- Archives original K-Merchant ZIPs, their extracted contents, eWallet CSVs, and eWallet E-Tax PDFs to Google Drive, organized by Year/Month/Day.
+- Implements a "replace" strategy for Google Drive uploads to ensure the latest version of a file is stored if reprocessed.
+- Runs automatically via GitHub Actions (scheduled or manual).
 
 ## Setup
 
@@ -51,22 +54,23 @@ Automated system for processing K-Merchant email reports, extracting CSV data, l
 |----------------------------------|--------------------------------------------------|
 | SUPABASE_URL                     | Supabase project URL                             |
 | SUPABASE_KEY                     | Supabase service role or anon key                |
-| ZIP_PASSWORD                     | Password for ZIP attachments                     |
-| GMAIL_USER_EMAIL                 | Gmail address to impersonate                     |
+| ZIP_PASSWORD                     | Password for K-Merchant ZIP attachments (eWallet reports do not require a password)          |
+| GMAIL_USER_EMAIL                 | Gmail address to impersonate (service account needs delegation for this)                    |
 | GDRIVE_ROOT_FOLDER_ID            | Google Drive folder ID for archiving             |
 | ADMIN_EMAIL                      | Email for admin notifications                    |
 | GOOGLE_SERVICE_ACCOUNT_KEY_PATH  | Path to service account JSON (default: service_account.json) |
 
 ## Usage
-- The app will process new K-Merchant report emails, extract and load data, and archive files to Google Drive.
+- The app will process new K-Merchant (ZIP/CSV) and KBank eWallet (CSV/PDF) report emails, extract and load data, and archive files to Google Drive.
 - Processed emails are labeled in Gmail to avoid reprocessing.
-- Logs are output to the console (no file logging by default).
+- Logs are output to the console.
 
 ## Troubleshooting
 - **Service account errors:** Ensure the JSON is valid and the secret is set correctly in GitHub.
 - **Google Drive permissions:** The service account must have access to the target folder.
-- **Supabase errors:** Check your URL and key, and ensure the database schema matches expectations.
-- **ZIP extraction issues:** Confirm the password is correct and the ZIP files are not corrupted.
+- **Supabase errors:** Check your URL and key, and ensure the database schema (e.g., `merchant_transaction_summaries` table with `report_source_type` column) matches expectations.
+- **ZIP extraction issues:** Confirm the password is correct and the K-Merchant ZIP files are not corrupted.
+- **eWallet CSV parsing issues:** Verify CSV format and column mapping for the 'MERCHANT TOTAL' row in `src/main.py` if data appears incorrect in Supabase.
 
 ## License
 MIT 

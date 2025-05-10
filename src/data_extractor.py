@@ -10,7 +10,7 @@ import io # Added import
 # Configure basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def extract_csv_data(csv_path, merchant_id="N/A", report_date="N/A"):
+def extract_csv_data(csv_path, merchant_id="N/A", report_date="N/A", process_date_arg="N/A", report_source_type="UNKNOWN"):
     """
     Extracts data from the K-Merchant TAX_SUMMARY_BY_TAX_ID_CSV file.
 
@@ -18,6 +18,10 @@ def extract_csv_data(csv_path, merchant_id="N/A", report_date="N/A"):
         csv_path (str): The path to the CSV file.
         merchant_id (str): The merchant ID, typically extracted from filename or email subject.
         report_date (str): The report date (e.g., YYYY-MM-DD), extracted from filename or email.
+        process_date_arg (str): The process date passed as an argument (e.g., YYYY-MM-DD). 
+                                For K-Merchant ZIPs, this is typically same as report_date.
+                                This is distinct from the 'PROCESS DATE' column within the CSV.
+        report_source_type (str): Identifier for the source of the report (e.g., KMERCHANT_ZIP).
 
     Returns:
         list: A list of dictionaries, where each dictionary represents a row of extracted data
@@ -93,10 +97,11 @@ def extract_csv_data(csv_path, merchant_id="N/A", report_date="N/A"):
                 'wht_tax_amount': safe_float(row[column_mapping['wht_tax']]),
                 'wht_code': str(row[column_mapping['wht_code']]) if column_mapping['wht_code'] in df.columns and pd.notna(row[column_mapping['wht_code']]) else None,
                 'settlement_currency': str(row[column_mapping['settlement_account_currency']]) if pd.notna(row[column_mapping['settlement_account_currency']]) else None,
-                'source_csv_filename': os.path.basename(csv_path)
+                'source_csv_filename': os.path.basename(csv_path),
+                'report_source_type': report_source_type
             }
             
-            # Only add record if process_date is valid, as it's a key field
+            # Only add record if process_date from CSV content is valid, as it's a key field
             if record['process_date']:
                 extracted_records.append(record)
             else:

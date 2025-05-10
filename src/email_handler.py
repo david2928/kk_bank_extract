@@ -16,6 +16,8 @@ logger = logging.getLogger(__name__)
 # Label names
 LABEL_PROCESSED = "KMERCHANT_PROCESSED"
 LABEL_FAILED = "KMERCHANT_PROCESSING_FAILED"
+LABEL_EWALLET_CSV_PROCESSED = "EWALLET_CSV_PROCESSED"
+LABEL_EWALLET_ETAX_PDF_PROCESSED = "EWALLET_ETAX_PDF_PROCESSED"
 
 # Default paths - these will be overridden by arguments in functions
 DEFAULT_CREDENTIALS_FILE = 'credentials.json'
@@ -67,10 +69,10 @@ def search_emails(service, query):
             response = service.users().messages().list(userId='me', q=query, pageToken=page_token).execute()
             if 'messages' in response:
                 messages.extend(response['messages'])
-        print(f"Found {len(messages)} messages matching query: '{query}'")
+        logger.info(f"Found {len(messages)} messages matching query: '{query}'")
         return messages
     except HttpError as error:
-        print(f'An error occurred searching emails: {error}')
+        logger.error(f'An error occurred searching emails with query "{query}": {error}')
         return []
 
 def download_specific_attachments(service, message_id, download_to_dir, desired_filename_extension=".zip"):
@@ -82,6 +84,7 @@ def download_specific_attachments(service, message_id, download_to_dir, desired_
 
         if not os.path.exists(download_to_dir):
             os.makedirs(download_to_dir)
+            logger.info(f"Created download directory: {download_to_dir}")
 
         for part in parts:
             filename = part.get('filename')
@@ -99,11 +102,11 @@ def download_specific_attachments(service, message_id, download_to_dir, desired_
                 with open(path, 'wb') as f:
                     f.write(file_data)
                 downloaded_files_info.append({'message_id': message_id, 'filename': filename, 'path': path})
-                print(f"Downloaded attachment: {filename} to {path}")
+                logger.info(f"Downloaded attachment: {filename} to {path} for message ID: {message_id}")
         
         return downloaded_files_info
     except HttpError as error:
-        print(f'An error occurred downloading attachments for message {message_id}: {error}')
+        logger.error(f'An error occurred downloading attachments for message {message_id}: {error}')
         return []
 
 def mark_email_as_read(service, message_id):
@@ -114,10 +117,10 @@ def mark_email_as_read(service, message_id):
             id=message_id,
             body={'removeLabelIds': ['UNREAD']}
         ).execute()
-        print(f"Marked message {message_id} as read.")
+        logger.info(f"Marked message {message_id} as read.")
         return True
     except HttpError as error:
-        print(f'An error occurred trying to mark message {message_id} as read: {error}')
+        logger.error(f'An error occurred trying to mark message {message_id} as read: {error}')
         return False
 
 def get_label_id(service, label_name):
@@ -129,24 +132,24 @@ def get_label_id(service, label_name):
             if label['name'] == label_name:
                 return label['id']
         
-        # Label not found, create it
-        print(f"Label '{label_name}' not found. Creating it.")
+        logger.info(f"Label '{label_name}' not found. Creating it.")
         new_label = {
             'name': label_name,
-            'labelListVisibility': 'labelShow',  # Show in label list
-            'messageListVisibility': 'show' # Show in message list (corrected from 'messageShow')
+            'labelListVisibility': 'labelShow',
+            'messageListVisibility': 'show'
         }
         created_label = service.users().labels().create(userId='me', body=new_label).execute()
-        print(f"Label '{label_name}' created with ID: {created_label['id']}")
+        logger.info(f"Label '{label_name}' created with ID: {created_label['id']}")
         return created_label['id']
     except HttpError as error:
-        print(f'An error occurred while getting/creating label {label_name}: {error}')
+        logger.error(f'An error occurred while getting/creating label {label_name}: {error}')
         return None
 
 def add_label_to_email(service, message_id, label_name):
     """Adds a label to the specified email message."""
     label_id = get_label_id(service, label_name)
     if not label_id:
+        logger.error(f"Could not get or create label ID for '{label_name}'. Cannot add label to message {message_id}.")
         return False
     try:
         service.users().messages().modify(
@@ -154,18 +157,17 @@ def add_label_to_email(service, message_id, label_name):
             id=message_id,
             body={'addLabelIds': [label_id]}
         ).execute()
-        print(f"Added label '{label_name}' to message {message_id}.")
+        logger.info(f"Added label '{label_name}' to message {message_id}.")
         return True
     except HttpError as error:
-        print(f"An error occurred trying to add label '{label_name}' to message {message_id}: {error}")
+        logger.error(f"An error occurred trying to add label '{label_name}' to message {message_id}: {error}")
         return False
 
 def remove_label_from_email(service, message_id, label_name):
     """Removes a label from the specified email message."""
-    label_id = get_label_id(service, label_name) # We need the ID to remove it
+    label_id = get_label_id(service, label_name) 
     if not label_id:
-        # If the label doesn't exist at all, we can't remove it from a message.
-        print(f"Label '{label_name}' does not exist. Cannot remove from message {message_id}.")
+        logger.warning(f"Label '{label_name}' does not exist or couldn't be fetched. Cannot remove from message {message_id}.")
         return False 
     try:
         service.users().messages().modify(
@@ -173,44 +175,72 @@ def remove_label_from_email(service, message_id, label_name):
             id=message_id,
             body={'removeLabelIds': [label_id]}
         ).execute()
-        print(f"Removed label '{label_name}' from message {message_id}.")
+        logger.info(f"Removed label '{label_name}' from message {message_id}.")
         return True
     except HttpError as error:
-        # It's possible the message didn't have the label, which can sometimes cause an error or just do nothing.
-        # Depending on API behavior, this error might indicate the label wasn't on the message.
-        print(f"An error occurred trying to remove label '{label_name}' from message {message_id}: {error}")
+        logger.error(f"An error occurred trying to remove label '{label_name}' from message {message_id}: {error}")
         return False
 
-def fetch_new_reports(service, search_query, download_to_dir):
+def fetch_new_reports(service, search_query, download_to_dir, attachment_config):
     """
-    Fetches new emails based on query, downloads .zip attachments, 
-    and returns list of dicts with message_id and path to downloaded zip.
+    Fetches new emails based on query, downloads specific attachments based on attachment_config,
+    and returns list of dicts with message_id, path to downloaded file, original filename, and report_type.
+
+    Args:
+        service: Gmail API service object.
+        search_query (str): The base Gmail search query.
+        download_to_dir (str): Directory to download attachments to.
+        attachment_config (dict): Configuration for attachments.
+            Expected keys:
+            'desired_filename_extension' (str): e.g., ".zip", ".csv", ".pdf"
+            'report_type' (str): Identifier for the type of report, e.g., "KMERCHANT_ZIP", "EWALLET_CSV"
+            'file_path_key' (str): Key to use in the result dict for the file path, e.g., "zip_path", "csv_path"
+            'processed_label' (str): The label to check for exclusion in the query.
     """
-    messages = search_emails(service, search_query)
-    all_downloaded_zips = []
+    
+    processed_label_name = attachment_config['processed_label']
+    final_query = f"{search_query} -label:{processed_label_name}"
+    
+    messages = search_emails(service, final_query)
+    all_downloaded_files = []
     if not messages:
-        print("No new messages found matching the query.")
-        return all_downloaded_zips
+        logger.info(f"No new messages found matching the query: {final_query} for report type: {attachment_config['report_type']}")
+        return all_downloaded_files
+
+    desired_extension = attachment_config['desired_filename_extension']
+    report_type = attachment_config['report_type']
+    file_path_key = attachment_config['file_path_key']
 
     for message_summary in messages:
         message_id = message_summary['id']
-        print(f"Processing message ID: {message_id}")
+        logger.info(f"Processing message ID: {message_id} for report type: {report_type}")
         
-        # Fetch full message details to check headers like Subject more easily if needed
-        # msg_detail = service.users().messages().get(userId='me', id=message_id).execute()
-        # subject_header = next((h['value'] for h in msg_detail['payload']['headers'] if h['name'] == 'Subject'), None)
-        # print(f"  Subject: {subject_header}")
-
-        downloaded_attachments_info = download_specific_attachments(service, message_id, download_to_dir, desired_filename_extension=".zip")
+        downloaded_attachments_info = download_specific_attachments(
+            service, 
+            message_id, 
+            download_to_dir, 
+            desired_filename_extension=desired_extension
+        )
         
         for attachment_info in downloaded_attachments_info:
-            all_downloaded_zips.append({
-                'message_id': message_id, # Keep message_id for marking as read later
-                'zip_path': attachment_info['path'],
-                'original_filename': attachment_info['filename']
-            })
-            
-    return all_downloaded_zips
+            # Ensure only one attachment of the desired type is processed per email,
+            # or adjust if multiple attachments of the same type per email are expected.
+            # For now, assumes the first one found is the target.
+            if attachment_info['filename'].lower().endswith(desired_extension.lower()):
+                all_downloaded_files.append({
+                    'message_id': message_id,
+                    file_path_key: attachment_info['path'],
+                    'original_filename': attachment_info['filename'],
+                    'report_type': report_type,
+                    'processed_label': processed_label_name # Pass along for potential use in main
+                })
+                logger.info(f"Successfully prepared info for {attachment_info['filename']} (Message ID: {message_id}) as {report_type}")
+                break # Process only the first matching attachment for this message. Remove if multiple are possible and needed.
+            else:
+                logger.warning(f"Skipping attachment {attachment_info['filename']} for message {message_id} as it does not match desired extension {desired_extension} (this should ideally not happen if download_specific_attachments works as expected).")
+
+    logger.info(f"Fetched {len(all_downloaded_files)} reports of type '{report_type}'.")
+    return all_downloaded_files
 
 if __name__ == '__main__':
     # --- Configuration for standalone testing ---
@@ -238,30 +268,87 @@ if __name__ == '__main__':
     print(f"Download directory: {DOWNLOAD_DIR_PATH}")
 
     if not os.path.exists(CREDENTIALS_FILE_PATH):
-        print(f"ERROR: Credentials file not found at {CREDENTIALS_FILE_PATH}")
-        print(f"Please ensure GMAIL_CREDENTIALS_PATH is set correctly in .env and points to a valid file.")
+        logger.error(f"ERROR: Credentials file not found at {CREDENTIALS_FILE_PATH}")
+        logger.error(f"Please ensure GMAIL_CREDENTIALS_PATH is set correctly in .env and points to a valid file.")
     else:
         gmail_service = get_gmail_service()
         
         if gmail_service:
-            print("Successfully authenticated with Gmail.")
+            logger.info("Successfully authenticated with Gmail for __main__ test.")
             
-            # Updated test search query
-            test_search_query = f'subject:("K-Merchant Reports as of") has:attachment -label:{LABEL_PROCESSED}'
-            print(f"Using search query: {test_search_query}")
-
-            downloaded_report_infos = fetch_new_reports(gmail_service, test_search_query, DOWNLOAD_DIR_PATH)
+            # Example usage for K-Merchant ZIP reports
+            kmerchant_zip_config = {
+                'desired_filename_extension': ".zip",
+                'report_type': "KMERCHANT_ZIP",
+                'file_path_key': "zip_path",
+                'processed_label': LABEL_PROCESSED 
+            }
+            kmerchant_search_query = 'subject:("K-Merchant Reports as of") has:attachment'
             
-            if downloaded_report_infos:
-                print(f"Successfully fetched and downloaded {len(downloaded_report_infos)} report(s):")
-                for report_info in downloaded_report_infos:
-                    print(f"  Message ID: {report_info['message_id']}, ZIP Path: {report_info['zip_path']}")
-                    # Example of marking as read (you'd do this after successful processing in main.py)
-                    # mark_email_as_read(gmail_service, report_info['message_id'])
+            logger.info(f"Using search query for KMERCHANT_ZIP: {kmerchant_search_query} -label:{kmerchant_zip_config['processed_label']}")
+            downloaded_zip_infos = fetch_new_reports(
+                gmail_service, 
+                kmerchant_search_query, 
+                DOWNLOAD_DIR_PATH, 
+                kmerchant_zip_config
+            )
+            
+            if downloaded_zip_infos:
+                logger.info(f"Successfully fetched and downloaded {len(downloaded_zip_infos)} K-Merchant ZIP report(s):")
+                for report_info in downloaded_zip_infos:
+                    logger.info(f"  Message ID: {report_info['message_id']}, ZIP Path: {report_info['zip_path']}, Type: {report_info['report_type']}")
             else:
-                print("No new reports were downloaded.")
+                logger.info("No new K-Merchant ZIP reports were downloaded.")
+
+            # Example usage for EWALLET_CSV reports
+            ewallet_csv_config = {
+                'desired_filename_extension': ".csv",
+                'report_type': "EWALLET_CSV",
+                'file_path_key': "csv_path",
+                'processed_label': LABEL_EWALLET_CSV_PROCESSED
+            }
+            ewallet_csv_search_query = 'subject:("EWALLET REPORT") has:attachment filename:.csv'
+
+            logger.info(f"Using search query for EWALLET_CSV: {ewallet_csv_search_query} -label:{ewallet_csv_config['processed_label']}")
+            downloaded_csv_infos = fetch_new_reports(
+                gmail_service,
+                ewallet_csv_search_query,
+                DOWNLOAD_DIR_PATH,
+                ewallet_csv_config
+            )
+
+            if downloaded_csv_infos:
+                logger.info(f"Successfully fetched and downloaded {len(downloaded_csv_infos)} eWallet CSV report(s):")
+                for report_info in downloaded_csv_infos:
+                    logger.info(f"  Message ID: {report_info['message_id']}, CSV Path: {report_info['csv_path']}, Type: {report_info['report_type']}")
+            else:
+                logger.info("No new eWallet CSV reports were downloaded.")
+
+            # Example usage for EWALLET_ETAX_PDF reports
+            ewallet_pdf_config = {
+                'desired_filename_extension': ".pdf",
+                'report_type': "EWALLET_ETAX_PDF",
+                'file_path_key': "pdf_path",
+                'processed_label': LABEL_EWALLET_ETAX_PDF_PROCESSED
+            }
+            ewallet_pdf_search_query = 'subject:("E-TAX INVOICE FOR EWALLET") has:attachment filename:.pdf'
+
+            logger.info(f"Using search query for EWALLET_ETAX_PDF: {ewallet_pdf_search_query} -label:{ewallet_pdf_config['processed_label']}")
+            downloaded_pdf_infos = fetch_new_reports(
+                gmail_service,
+                ewallet_pdf_search_query,
+                DOWNLOAD_DIR_PATH,
+                ewallet_pdf_config
+            )
+
+            if downloaded_pdf_infos:
+                logger.info(f"Successfully fetched and downloaded {len(downloaded_pdf_infos)} eWallet E-Tax PDF report(s):")
+                for report_info in downloaded_pdf_infos:
+                    logger.info(f"  Message ID: {report_info['message_id']}, PDF Path: {report_info['pdf_path']}, Type: {report_info['report_type']}")
+            else:
+                logger.info("No new eWallet E-Tax PDF reports were downloaded.")
         else:
-            print("Failed to get Gmail service.")
+            logger.error("Failed to get Gmail service for __main__ test.")
 
     # TODO:
     # - Refine search query based on DESIGN_DOCUMENT.md

@@ -117,6 +117,51 @@ def upload_file_to_gdrive(service, local_file_path, gdrive_folder_id, remote_fil
         logger.error(f"An unexpected error occurred during Google Drive upload of '{upload_filename}': {e}", exc_info=True)
         return None
 
+def find_file_id_by_name_in_folder(service, folder_id, filename):
+    """
+    Finds a file by its exact name within a specific Google Drive folder.
+    Returns the file ID if found, otherwise None.
+    """
+    try:
+        # Ensure filename is properly escaped for the query
+        escaped_filename = filename.replace("'", "\\'")
+        query = f"name = '{escaped_filename}' and '{folder_id}' in parents and trashed = false"
+        response = service.files().list(q=query,
+                                        spaces='drive',
+                                        fields='files(id, name)').execute()
+        files = response.get('files', [])
+        if files:
+            logger.info(f"Found file '{filename}' with ID {files[0]['id']} in folder {folder_id}.")
+            return files[0]['id']
+        else:
+            logger.info(f"File '{filename}' not found in folder {folder_id}.")
+            return None
+    except HttpError as error:
+        logger.error(f"HttpError searching for file '{filename}' in folder {folder_id}: {error}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error searching for file '{filename}' in folder {folder_id}: {e}", exc_info=True)
+        return None
+
+def delete_file_by_id(service, file_id):
+    """
+    Permanently deletes a file from Google Drive given its ID.
+    Returns True if successful, False otherwise.
+    """
+    try:
+        service.files().delete(fileId=file_id).execute()
+        logger.info(f"Successfully deleted file with ID: {file_id} from Google Drive.")
+        return True
+    except HttpError as error:
+        if error.resp.status == 404:
+            logger.warning(f"File with ID {file_id} not found for deletion (already deleted or wrong ID).")
+            return True # Treat as success if already gone
+        logger.error(f"HttpError deleting file ID {file_id}: {error}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error deleting file ID {file_id}: {e}", exc_info=True)
+        return False
+
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
     logger.info("Testing Google Drive Handler...")
