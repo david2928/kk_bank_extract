@@ -4,6 +4,8 @@ on:
   push:
     branches: [ main ] # Triggers on push to the main branch
   workflow_dispatch: # Allows manual triggering from the Actions tab
+  schedule:
+    - cron: '0 0 * * *'  # Every day at 00:00 UTC (7:00am Thailand time)
 
 jobs:
   process_reports:
@@ -39,17 +41,9 @@ jobs:
 
     - name: Create Service Account JSON from Secret
       run: |
-        echo "Attempting to write service account JSON..."
         cat <<EOF > ${{ env.GOOGLE_SERVICE_ACCOUNT_KEY_PATH }}
         ${{ secrets.GOOGLE_SERVICE_ACCOUNT_CREDENTIALS_JSON }}
         EOF
-        echo "Finished writing. Verifying file content (first 5 lines and full content):"
-        echo "---- BEGIN First 5 lines of file ----"
-        head -n 5 ${{ env.GOOGLE_SERVICE_ACCOUNT_KEY_PATH }}
-        echo "---- END First 5 lines of file ----"
-        echo "---- BEGIN Full content of file ----"
-        cat ${{ env.GOOGLE_SERVICE_ACCOUNT_KEY_PATH }}
-        echo "---- END Full content of file ----"
       shell: bash
 
     - name: Run K-Merchant Report Processor
