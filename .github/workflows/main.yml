@@ -37,11 +37,9 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    - name: Create Google Service Account Key File
-      # Writes the content of the GOOGLE_SERVICE_ACCOUNT_KEY_JSON secret 
-      # to the file specified by env.GOOGLE_SERVICE_ACCOUNT_KEY_PATH
-      run: echo "${{ secrets.GOOGLE_SERVICE_ACCOUNT_KEY_JSON }}" > ${{ env.GOOGLE_SERVICE_ACCOUNT_KEY_PATH }}
-      shell: bash # Ensure bash is used for echo with quotes
+    - name: Create Service Account JSON from Secret
+      run: |
+        printf '%s' "${{ secrets.GOOGLE_SERVICE_ACCOUNT_CREDENTIALS_JSON }}" > ${{ env.GOOGLE_SERVICE_ACCOUNT_KEY_PATH }}
 
     - name: Run K-Merchant Report Processor
       run: python -m src.main 
