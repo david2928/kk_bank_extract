@@ -38,8 +38,12 @@ jobs:
         pip install -r requirements.txt
 
     - name: Create Service Account JSON from Secret
+      env:
+        SERVICE_ACCOUNT_JSON_CONTENT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_CREDENTIALS_JSON }}
       run: |
-        printf '%s' "${{ secrets.GOOGLE_SERVICE_ACCOUNT_CREDENTIALS_JSON }}" > ${{ env.GOOGLE_SERVICE_ACCOUNT_KEY_PATH }}
+        python -c "import os; 
+        with open(os.environ['GOOGLE_SERVICE_ACCOUNT_KEY_PATH'], 'w') as f: 
+            f.write(os.environ['SERVICE_ACCOUNT_JSON_CONTENT'])"
 
     - name: Run K-Merchant Report Processor
       run: python -m src.main 
