@@ -61,23 +61,25 @@ def extract_csv_data(csv_path, merchant_id="N/A", report_date="N/A", process_dat
             'wht_code': 'vat_code' # Assuming 'vat_code' from CSV might be 'wht_code' as per data model, or it's genuinely different
         }
 
-        # Check for required columns based on the *values* in our mapping that are expected in the CSV
-        expected_csv_columns = [column_mapping[key] for key in [
+        # Check for required columns (core columns that must be present)
+        required_columns = [column_mapping[key] for key in [
             'process_date', 'trans_item', 'total_amt', 'total_fee_commission_amount',
-            'vat', 'net_debit_amt', 'net_credit_amt', 'wht_tax', 'settlement_account_currency'
+            'vat', 'net_debit_amt', 'net_credit_amt', 'wht_tax'
         ]]
         
-        # 'wht_code' is handled more flexibly as it might map to 'vat_code' or be absent
-        if column_mapping['wht_code'] in df.columns:
-            pass # It's present, good.
-        elif 'wht_code' not in column_mapping.values() and 'vat_code' not in df.columns and 'wht_code' in column_mapping : # if wht_code was a target and not found and vat_code not found.
-            logging.warning(f"Column for WHT Code (expected as '{column_mapping['wht_code']}' or similar) not found in CSV.")
-
-
-        missing_cols = [col for col in expected_csv_columns if col not in df.columns]
-        if missing_cols:
-            logging.error(f"Missing required columns in CSV {csv_path}: {missing_cols}. Available columns: {df.columns.tolist()}")
+        # Check for optional columns that might be missing in some CSV formats
+        optional_columns = [column_mapping[key] for key in [
+            'settlement_account_currency', 'wht_code'
+        ]]
+        
+        missing_required_cols = [col for col in required_columns if col not in df.columns]
+        if missing_required_cols:
+            logging.error(f"Missing required columns in CSV {csv_path}: {missing_required_cols}. Available columns: {df.columns.tolist()}")
             return []
+            
+        missing_optional_cols = [col for col in optional_columns if col not in df.columns]
+        if missing_optional_cols:
+            logging.warning(f"Missing optional columns in CSV {csv_path}: {missing_optional_cols}. Will use default values.")
 
         extracted_records = []
         for index, row in df.iterrows():
@@ -96,7 +98,7 @@ def extract_csv_data(csv_path, merchant_id="N/A", report_date="N/A", process_dat
                 'net_credit_amount': safe_float(row[column_mapping['net_credit_amt']]),
                 'wht_tax_amount': safe_float(row[column_mapping['wht_tax']]),
                 'wht_code': str(row[column_mapping['wht_code']]) if column_mapping['wht_code'] in df.columns and pd.notna(row[column_mapping['wht_code']]) else None,
-                'settlement_currency': str(row[column_mapping['settlement_account_currency']]) if pd.notna(row[column_mapping['settlement_account_currency']]) else None,
+                'settlement_currency': str(row[column_mapping['settlement_account_currency']]) if column_mapping['settlement_account_currency'] in df.columns and pd.notna(row[column_mapping['settlement_account_currency']]) else 'THB',
                 'source_csv_filename': os.path.basename(csv_path),
                 'report_source_type': report_source_type
             }
