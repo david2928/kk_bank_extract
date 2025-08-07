@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(dir:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(gh run list:*)",
+      "Bash(gh auth:*)",
+      "Bash(gh run view:*)",
+      "mcp__supabase__execute_sql",
+      "mcp__supabase__list_tables",
+      "Bash(python test:*)",
+      "Bash(del test_deduplication.py)",
+      "Bash(rm:*)",
+      "mcp__supabase__apply_migration",
+      "Bash(git add:*)",
+      "Bash(git reset:*)"
+    ],
+    "deny": []
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "supabase"
+  ]
+}

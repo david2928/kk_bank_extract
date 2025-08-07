@@ -26,6 +26,10 @@ downloaded_reports/
 # Output files / logs (if any specific ones are generated and not needed in repo)
 # *.log
 
+# Node.js
+node_modules/
+package-lock.json
+
 # OS-specific
 .DS_Store
 Thumbs.db 

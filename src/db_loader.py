@@ -101,15 +101,52 @@ def load_data_to_supabase(table_name: str, data_list: list, conflict_columns: li
     return success_count, failure_count
 
 
+def _deduplicate_records(data_list: list, unique_keys: list):
+    """
+    Deduplicates records based on the specified unique keys.
+    
+    Args:
+        data_list (list): List of dictionaries representing records.
+        unique_keys (list): List of keys that form the unique constraint.
+        
+    Returns:
+        list: Deduplicated list of records. If duplicates exist, the last occurrence is kept.
+    """
+    if not data_list or not unique_keys:
+        return data_list
+    
+    # Use a dictionary to track unique records by their unique key combination
+    unique_records = {}
+    
+    for record in data_list:
+        # Create a tuple of values for the unique keys to use as a dictionary key
+        unique_key_values = tuple(record.get(key) for key in unique_keys)
+        
+        # Store the record, overwriting any previous record with the same unique key
+        # This keeps the last occurrence of duplicate records
+        unique_records[unique_key_values] = record
+    
+    # Return the deduplicated records as a list
+    deduplicated_list = list(unique_records.values())
+    
+    return deduplicated_list
+
+
 # Specific functions for each table (optional, but can be convenient)
 def load_merchant_transaction_summaries(data_list: list):
     """Loads data into the merchant_transaction_summaries table."""
-    # From DESIGN_DOCUMENT.md: Unique Constraint: (`merchant_id`, `report_date`, `process_date`)
-    # These need to be actual column names in your Supabase table.
-    conflict_cols = ['merchant_id', 'report_date', 'process_date'] 
+    # Updated Unique Constraint: (`merchant_id`, `report_date`, `process_date`, `tax_invoice_no`)
+    # This ensures records with different tax invoice numbers are treated as separate records
+    conflict_cols = ['merchant_id', 'report_date', 'process_date', 'tax_invoice_no'] 
+    
+    # Deduplicate records to prevent "ON CONFLICT DO UPDATE command cannot affect row a second time" error
+    deduplicated_data = _deduplicate_records(data_list, conflict_cols)
+    if len(deduplicated_data) < len(data_list):
+        logging.warning(f"Deduplicated {len(data_list) - len(deduplicated_data)} duplicate records before loading to merchant_transaction_summaries. Original: {len(data_list)}, Deduplicated: {len(deduplicated_data)}")
+    
     return load_data_to_supabase(
         table_name="merchant_transaction_summaries", 
-        data_list=data_list,
+        data_list=deduplicated_data,
         conflict_columns=conflict_cols
     )
 

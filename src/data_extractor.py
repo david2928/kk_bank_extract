@@ -49,6 +49,7 @@ def extract_csv_data(csv_path, merchant_id="N/A", report_date="N/A", process_dat
 
         # Adjusted mapping based on actual CSV output
         column_mapping = {
+            'tax_invoice_no': 'tax_invoice_no',  # Added tax invoice number field
             'process_date': 'process_date',
             'trans_item': 'trans__item',  # Adjusted from trans_item
             'total_amt': 'total_amt',
@@ -69,7 +70,7 @@ def extract_csv_data(csv_path, merchant_id="N/A", report_date="N/A", process_dat
         
         # Check for optional columns that might be missing in some CSV formats
         optional_columns = [column_mapping[key] for key in [
-            'settlement_account_currency', 'wht_code'
+            'tax_invoice_no', 'settlement_account_currency', 'wht_code'
         ]]
         
         missing_required_cols = [col for col in required_columns if col not in df.columns]
@@ -90,6 +91,7 @@ def extract_csv_data(csv_path, merchant_id="N/A", report_date="N/A", process_dat
                 'merchant_id': merchant_id,
                 'report_date': report_date,
                 'process_date': pd.to_datetime(row[column_mapping['process_date']], dayfirst=True, errors='coerce').strftime('%Y-%m-%d') if pd.notna(row[column_mapping['process_date']]) else None,
+                'tax_invoice_no': str(row[column_mapping['tax_invoice_no']]) if column_mapping['tax_invoice_no'] in df.columns and pd.notna(row[column_mapping['tax_invoice_no']]) else None,
                 'trans_item_description': str(row[column_mapping['trans_item']]) if pd.notna(row[column_mapping['trans_item']]) else None,
                 'total_amount': safe_float(row[column_mapping['total_amt']]),
                 'total_fee_commission_amount': safe_float(row[column_mapping['total_fee_commission_amount']]),
