@@ -47,4 +47,18 @@ jobs:
       shell: bash
 
     - name: Run K-Merchant Report Processor
-      run: python -m src.main 
+      run: python -m src.main
+
+    - name: Keep workflow active (monthly)
+      if: github.event_name == 'schedule'
+      run: |
+        # Only commit on the 1st of each month
+        if [ $(date +%d) -eq 01 ]; then
+          mkdir -p .github
+          echo "Last automated run: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" > .github/.workflow-keepalive
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/.workflow-keepalive
+          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: keep workflow active [skip ci]" && git push)
+        fi
+      shell: bash
