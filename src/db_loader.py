@@ -3,7 +3,7 @@
 import logging
 import os
 from supabase import create_client, Client
-from src.config import SUPABASE_URL, SUPABASE_KEY
+from src.config import SUPABASE_URL, SUPABASE_KEY, SUPABASE_SCHEMA
 
 # Configure basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -53,18 +53,13 @@ def load_data_to_supabase(table_name: str, data_list: list, conflict_columns: li
     try:
         # Supabase client's insert method can handle a list of dicts directly.
         # For upsert, ensure your Supabase table has the appropriate unique constraints defined on conflict_columns.
+        # Use the configured schema (defaults to 'finance' for lengolf Supabase)
+        table_query = client.schema(SUPABASE_SCHEMA).table(table_name) if SUPABASE_SCHEMA else client.table(table_name)
+
         if conflict_columns:
-            # The python client upsert method implicitly uses the primary key for conflict
-            # or you can define unique constraints on the table and use `ignore_duplicates=False` 
-            # with `on_conflict` (though `on_conflict` parameter for specific columns is more SQL-like and might not be directly supported this way).
-            # A common pattern for upsert on specific columns is to ensure those columns form a UNIQUE constraint in the DB.
-            # The `upsert` method in supabase-py v1.x and v2.x defaults to using the primary key for conflict resolution
-            # or it can update if a unique constraint is met. For specific `ON CONFLICT (col1, col2) DO UPDATE` type behavior,
-            # it's often managed by the table's unique constraints.
-            # We'll use `upsert=True` which generally means insert or update on conflict based on PK or unique constraints.
-            response = client.table(table_name).upsert(data_list, on_conflict=",".join(conflict_columns) if isinstance(conflict_columns, list) else conflict_columns).execute()
+            response = table_query.upsert(data_list, on_conflict=",".join(conflict_columns) if isinstance(conflict_columns, list) else conflict_columns).execute()
         else:
-            response = client.table(table_name).insert(data_list).execute()
+            response = table_query.insert(data_list).execute()
         
         # `execute()` returns an APIResponse object. We need to check its data.
         # For bulk operations, the response might not directly give individual success/failure for each item

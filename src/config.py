@@ -10,6 +10,7 @@ load_dotenv(os.path.join(PROJECT_ROOT, '.env'))
 # Supabase Configuration
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_SCHEMA = os.getenv("SUPABASE_SCHEMA", "finance")
 
 # ZIP File Configuration
 ZIP_PASSWORD = os.getenv("ZIP_PASSWORD")
