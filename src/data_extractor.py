@@ -125,6 +125,154 @@ def extract_csv_data(csv_path, merchant_id="N/A", report_date="N/A", process_dat
         logging.error(f"Columns at time of error: {df.columns.tolist() if 'df' in locals() else 'DataFrame not loaded'}")
         return []
 
+# --- e-Tax PDF parser (EWALLET_ETAX_PDF) ---
+
+# Map Thai digits to Arabic. Used everywhere before regex matching, since
+# KBank Thai e-Tax PDFs sometimes mix Thai numerals into amounts and dates.
+_THAI_DIGITS = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
+
+
+def _thai_digits_to_arabic(s):
+    if s is None:
+        return s
+    return str(s).translate(_THAI_DIGITS)
+
+
+def _normalize_thai_year(date_str):
+    """If the year in a parsed date is in the Thai Buddhist era (>= 2400), subtract 543."""
+    parts = re.split(r"[/\-\. ]", date_str.strip())
+    if len(parts) == 3:
+        try:
+            year = int(parts[2])
+            if year >= 2400:
+                year -= 543
+                parts[2] = f"{year:04d}"
+                return "/".join(parts)
+        except ValueError:
+            pass
+    return date_str
+
+
+def extract_ewallet_etax_pdf_data(pdf_path, password=None):
+    """
+    Parses a KBank e-Wallet e-Tax invoice PDF.
+
+    Args:
+        pdf_path: path to the PDF file.
+        password: PDF password. If None, reads ZIP_PASSWORD from src.config
+                  (KBank uses the same secret for ZIP archives and ETAX PDFs).
+
+    Returns a dict:
+        {
+            'tax_invoice_no': str,
+            'tax_invoice_date': 'YYYY-MM-DD',
+            'comm': float,             # commission amount (pre-VAT)
+            'vat': float,              # VAT on commission
+            'net_after_vat': float,    # comm + vat (total fee paid)
+        }
+    or None if any required field cannot be located.
+    """
+    if not os.path.exists(pdf_path):
+        logging.error(f"E-Tax PDF not found: {pdf_path}")
+        return None
+
+    try:
+        import pdfplumber
+    except ImportError:
+        logging.error("pdfplumber is not installed. Add 'pdfplumber' to requirements.txt.")
+        return None
+
+    if password is None:
+        try:
+            from src.config import ZIP_PASSWORD
+            password = ZIP_PASSWORD
+        except ImportError:
+            password = None
+
+    try:
+        with pdfplumber.open(pdf_path, password=password or "") as pdf:
+            text_parts = []
+            for page in pdf.pages:
+                page_text = page.extract_text() or ""
+                text_parts.append(page_text)
+            raw_text = "\n".join(text_parts)
+    except Exception as e:
+        logging.error(f"Failed to open/read PDF {pdf_path} via pdfplumber: {e}", exc_info=True)
+        return None
+
+    if not raw_text.strip():
+        logging.error(f"PDF {pdf_path} produced no extractable text.")
+        return None
+
+    text = _thai_digits_to_arabic(raw_text)
+
+    # KBank e-Wallet e-Tax invoices have a bilingual header block:
+    #     วันที่ออกเอกสาร      เลขที่เอกสาร
+    #     Issued Date          Document number
+    #     17/03/2025           370170325W01234
+    # Capture the date and document number from the line immediately after the
+    # English label row.
+    header_match = re.search(
+        r"Issued\s+Date\s+Document\s+number\s*\n\s*"
+        r"(\d{1,2}/\d{1,2}/\d{2,4})\s+([A-Za-z0-9][A-Za-z0-9\-/]*)",
+        text,
+    )
+    if not header_match:
+        logging.error(f"Issued Date/Document number block not found in {pdf_path}. First 500 chars: {text[:500]!r}")
+        return None
+    raw_date = _normalize_thai_year(header_match.group(1))
+    tax_invoice_no = header_match.group(2).strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9\-/]{3,}", tax_invoice_no):
+        logging.error(f"Captured tax_invoice_no '{tax_invoice_no}' from {pdf_path} does not look valid.")
+        return None
+
+    tax_invoice_date = parse_date_from_string(
+        raw_date,
+        date_formats=["%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d %m %Y"],
+    )
+    if not tax_invoice_date:
+        logging.error(f"Could not parse tax_invoice_date '{raw_date}' from {pdf_path}.")
+        return None
+
+    # Amounts row example:
+    #     กระเป๋าเงินอิเล็กทรอนิกส์ 1 8,500.00 136.00 9.52 8,354.48
+    # Columns: payment_type, item_count, gross, fee/commission, vat, net_credit
+    amounts_match = re.search(
+        r"กระเป๋าเงินอิเล็กทรอนิกส์\s+\d+\s+"
+        r"([\d,]+\.\d{2})\s+"   # gross (unused in return value but parsed for sanity)
+        r"([\d,]+\.\d{2})\s+"   # fee / commission
+        r"([\d,]+\.\d{2})\s+"   # VAT
+        r"([\d,]+\.\d{2})",     # net credit (= net_after_vat)
+        text,
+    )
+    if not amounts_match:
+        logging.error(f"E-Wallet amounts row not found in {pdf_path}. First 500 chars: {text[:500]!r}")
+        return None
+    gross = safe_float(amounts_match.group(1))
+    comm = safe_float(amounts_match.group(2))
+    vat = safe_float(amounts_match.group(3))
+    net_after_vat = safe_float(amounts_match.group(4))
+
+    # Sanity: gross should equal comm + vat + net_after_vat (within rounding).
+    if abs(gross - (comm + vat + net_after_vat)) > 0.02:
+        logging.warning(
+            f"Amount sanity check failed in {pdf_path}: gross={gross} but comm+vat+net={comm+vat+net_after_vat}"
+        )
+
+    missing = [name for name, val in (("comm", comm), ("vat", vat), ("net_after_vat", net_after_vat)) if val is None]
+    if missing:
+        logging.error(f"Missing amount fields {missing} in {pdf_path}. First 500 chars: {text[:500]!r}")
+        return None
+
+    return {
+        "tax_invoice_no": tax_invoice_no,
+        "tax_invoice_date": tax_invoice_date,
+        "comm": comm,
+        "vat": vat,
+        "net_after_vat": net_after_vat,
+    }
+
+
 def parse_date_from_string(date_str, date_formats=["%d/%m/%Y"]):
     """Helper to parse date string with multiple formats."""
     if not date_str: return None

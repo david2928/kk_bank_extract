@@ -7,15 +7,20 @@ import tempfile
 import shutil
 import re
 import traceback # For detailed error logging
-from datetime import datetime
+from datetime import datetime, date
 # from logging.handlers import RotatingFileHandler # Removed for file logging
 import csv # Added for CSV parsing
 
 # Import the config module itself
 from src import config 
 from src.zip_processor import extract_zip
-from src.data_extractor import extract_csv_data # Removed extract_pdf_data
-from src.db_loader import load_merchant_transaction_summaries, get_supabase_client # Added get_supabase_client
+from src.data_extractor import extract_csv_data, extract_ewallet_etax_pdf_data # Removed extract_pdf_data
+from src.db_loader import (
+    load_merchant_transaction_summaries,
+    get_supabase_client,
+    get_ewallet_csv_summary,
+    update_ewallet_csv_tax_invoice_no,
+)
 from src import email_handler
 from src import gdrive_handler # Added for Google Drive operations
 
@@ -417,10 +422,18 @@ def process_ewallet_csv(report_info, gdrive_service, supabase_client):
         logger.error(f"ERROR processing EWALLET_CSV file {original_filename} (path: {csv_path}): {e}", exc_info=True)
         return False
 
-def process_ewallet_etax_pdf(report_info, gdrive_service):
+def process_ewallet_etax_pdf(report_info, gdrive_service, supabase_client):
     """
-    Processes a single eWallet E-TAX PDF file.
-    Only archives to GDrive.
+    Processes a single eWallet E-TAX PDF file: archives to GDrive, parses the
+    tax invoice number, and back-populates the matching EWALLET_CSV summary row.
+
+    Returns one of:
+        "PROCESSED" — fully done; caller should add EWALLET_ETAX_PDF_PROCESSED label
+        "RETRY"     — GDrive done but DB update couldn't run / found 0 rows AND the
+                      file is < 24h old; caller should NOT add any label so the
+                      next scheduled run picks it up again
+        "FAILED"    — GDrive upload or PDF parsing failed; caller should add
+                      EWALLET_ETAX_PROCESSING_FAILED label
     """
     pdf_path = report_info['pdf_path']
     original_filename = report_info['original_filename']
@@ -428,30 +441,33 @@ def process_ewallet_etax_pdf(report_info, gdrive_service):
 
     logging.info(f"Processing EWALLET_ETAX_PDF: {original_filename} (path: {pdf_path})")
     gdrive_upload_successful = False
-    
+
     try:
-        # For E-Tax PDF, filename might not have a clear date for folder structure.
-        # We might need to parse date from email subject or use email received date if available.
-        # "E-TAX INVOICE FOR EWALLET 401016061373001 LENGOLF" - no date in this example subject.
-        # Example filename: E-TAX_INVOICE_EWALLET_401016061373001_02022025.pdf should go to 2025/202502/2025-02-02
-        
+        # Filename example: E-TAX_INVOICE_EWALLET_401016061373001_02022025.pdf
+        # → merchant_id=401016061373001, process_date=2025-02-02, GDrive folder 2025/202502/2025-02-02
+        merchant_id = None
         date_for_gdrive_folder = None
-        # Try to match DDMMYYYY at the end of the filename, preceded by an underscore
+        process_date_obj = None
+
+        merchant_match = re.search(r"E-TAX_INVOICE_EWALLET_(\d+)_\d{8}\.pdf$", original_filename, re.IGNORECASE)
+        if merchant_match:
+            merchant_id = merchant_match.group(1)
+
         match_date = re.search(r"_(\d{8})\.pdf$", original_filename, re.IGNORECASE)
         if match_date:
             date_str_ddmmyyyy = match_date.group(1)
             try:
-                date_for_gdrive_folder = datetime.strptime(date_str_ddmmyyyy, "%d%m%Y").strftime("%Y-%m-%d")
+                process_date_obj = datetime.strptime(date_str_ddmmyyyy, "%d%m%Y").date()
+                date_for_gdrive_folder = process_date_obj.strftime("%Y-%m-%d")
                 logger.info(f"Parsed date {date_for_gdrive_folder} from ETAX PDF filename: {original_filename}")
             except ValueError:
                 logger.warning(f"Could not parse DDMMYYYY date string '{date_str_ddmmyyyy}' from ETAX PDF filename {original_filename}. Will use current date.")
         else:
             logger.warning(f"Date pattern not found in ETAX PDF filename {original_filename}. Will use current date.")
-        
+
         if not date_for_gdrive_folder:
             date_for_gdrive_folder = datetime.now().strftime("%Y-%m-%d")
             logger.warning(f"Using current date {date_for_gdrive_folder} for GDrive archival folder for {original_filename}.")
-
 
         if gdrive_service and date_for_gdrive_folder:
             day_folder_id = _ensure_gdrive_folder_structure(gdrive_service, date_for_gdrive_folder, config.GDRIVE_ROOT_FOLDER_ID)
@@ -461,7 +477,7 @@ def process_ewallet_etax_pdf(report_info, gdrive_service):
                 if existing_pdf_id:
                     logger.info(f"Found existing eWallet ETAX PDF '{original_filename}' (ID: {existing_pdf_id}) in GDrive folder {day_folder_id}. Deleting it.")
                     gdrive_handler.delete_file_by_id(gdrive_service, existing_pdf_id)
-                
+
                 if gdrive_handler.upload_file_to_gdrive(gdrive_service, pdf_path, day_folder_id, remote_filename=original_filename):
                     gdrive_upload_successful = True
                     logger.info(f"Successfully uploaded {original_filename} to Google Drive.")
@@ -472,12 +488,92 @@ def process_ewallet_etax_pdf(report_info, gdrive_service):
         elif not gdrive_service:
             logger.error("Google Drive service not available. Skipping GDrive upload for eWallet ETAX PDF.")
         elif not date_for_gdrive_folder:
-             logger.error(f"Date for GDrive folder structure unknown for {original_filename}. Skipping GDrive upload.")
+            logger.error(f"Date for GDrive folder structure unknown for {original_filename}. Skipping GDrive upload.")
 
-        return gdrive_upload_successful
+        if not gdrive_upload_successful:
+            return "FAILED"
+
+        # ---- Parse + back-populate tax_invoice_no on the matching EWALLET_CSV row ----
+        if not merchant_id or not process_date_obj:
+            logger.error(
+                f"Cannot derive merchant_id/process_date from filename '{original_filename}'. "
+                f"Skipping DB update."
+            )
+            return "FAILED"
+
+        parsed = extract_ewallet_etax_pdf_data(pdf_path)
+        if not parsed:
+            logger.error(f"Failed to parse e-Tax PDF {original_filename}; tax_invoice_no will not be populated.")
+            return "FAILED"
+
+        logger.info(
+            f"Parsed e-Tax PDF {original_filename}: tax_invoice_no={parsed['tax_invoice_no']}, "
+            f"date={parsed['tax_invoice_date']}, comm={parsed['comm']}, vat={parsed['vat']}, "
+            f"net_after_vat={parsed['net_after_vat']}"
+        )
+
+        process_date_str = process_date_obj.strftime("%Y-%m-%d")
+
+        if not supabase_client:
+            logger.warning(
+                f"Supabase client not available; cannot update tax_invoice_no for {original_filename}. "
+                f"Will retry on next run."
+            )
+            return "RETRY"
+
+        # Cross-validate parsed amounts against the existing CSV row
+        csv_row = get_ewallet_csv_summary(merchant_id, process_date_str)
+        if csv_row:
+            csv_comm = csv_row.get('total_fee_commission_amount')
+            csv_vat = csv_row.get('vat_on_fee_amount')
+            csv_net = csv_row.get('net_credit_amount')
+            for label, pdf_val, csv_val in (
+                ("comm", parsed['comm'], csv_comm),
+                ("vat", parsed['vat'], csv_vat),
+                ("net_credit", parsed['net_after_vat'], csv_net),
+            ):
+                if csv_val is not None and abs(float(csv_val) - float(pdf_val)) > 0.01:
+                    logger.warning(
+                        f"PDF/CSV {label} mismatch for merchant_id={merchant_id} process_date={process_date_str}: "
+                        f"PDF={pdf_val} CSV={csv_val}. Proceeding with tax_invoice_no update anyway."
+                    )
+
+        rows_updated = update_ewallet_csv_tax_invoice_no(
+            merchant_id=merchant_id,
+            process_date=process_date_str,
+            tax_invoice_no=parsed['tax_invoice_no'],
+        )
+        if rows_updated >= 1:
+            return "PROCESSED"
+
+        # 0 rows updated: either CSV not yet ingested, or CSV row already has a tax_invoice_no.
+        if csv_row and csv_row.get('tax_invoice_no'):
+            logger.info(
+                f"EWALLET_CSV row for merchant_id={merchant_id} process_date={process_date_str} "
+                f"already has tax_invoice_no={csv_row['tax_invoice_no']}. No update needed."
+            )
+            return "PROCESSED"
+
+        # Age threshold of 2 days (not 1) absorbs timezone skew between the
+        # UTC GitHub Actions runner and the Bangkok-local filename date — a PDF
+        # received at 07:30 Bangkok already shows age_days=1 on a UTC clock
+        # before the matching CSV email had time to arrive.
+        age_days = (date.today() - process_date_obj).days
+        if age_days >= 2:
+            logger.warning(
+                f"No matching EWALLET_CSV row for merchant_id={merchant_id} process_date={process_date_str} "
+                f"after {age_days}d; CSV email may have been missed. Marking PDF email PROCESSED to avoid infinite retry."
+            )
+            return "PROCESSED"
+
+        logger.info(
+            f"No matching EWALLET_CSV row yet for merchant_id={merchant_id} process_date={process_date_str} "
+            f"(age {age_days}d). Deferring labeling — will retry on next run."
+        )
+        return "RETRY"
     except Exception as e:
         logger.error(f"ERROR processing EWALLET_ETAX_PDF file {original_filename} (path: {pdf_path}): {e}", exc_info=True)
-        return False
+        return "FAILED"
 
 def main():
     logging.info("Starting K-Merchant Email Report Processing System...")
@@ -580,7 +676,9 @@ def main():
         current_failed_label = current_config['failed_label']
         
         processing_successful = False
-        
+        # Tri-state outcome used only for EWALLET_ETAX_PDF: "PROCESSED" | "RETRY" | "FAILED"
+        etax_outcome = None
+
         try:
             if report_type == "KMERCHANT_ZIP":
                 if not gdrive_service: logging.warning("GDrive service unavailable for KMERCHANT_ZIP processing.")
@@ -591,22 +689,28 @@ def main():
                 processing_successful = process_ewallet_csv(report_info, gdrive_service, supabase_client)
             elif report_type == "EWALLET_ETAX_PDF":
                 if not gdrive_service: logging.warning("GDrive service unavailable for EWALLET_ETAX_PDF processing.")
-                processing_successful = process_ewallet_etax_pdf(report_info, gdrive_service)
+                etax_outcome = process_ewallet_etax_pdf(report_info, gdrive_service, supabase_client)
+                processing_successful = (etax_outcome == "PROCESSED")
             else:
                 logging.warning(f"Unknown report type: {report_type} for message {message_id}, file {original_filename}. Skipping.")
                 processing_successful = False
 
-            if processing_successful:
+            if etax_outcome == "RETRY":
+                # Don't label either way — leave the email un-touched so the next scheduled run picks it up.
+                logging.info(
+                    f"Deferred labeling for EWALLET_ETAX_PDF (MsgID: {message_id}, File: {original_filename}) — will retry on next run."
+                )
+            elif processing_successful:
                 successful_processing_count += 1
                 logging.info(f"Successfully processed: {report_type} from Message ID: {message_id}, File: {original_filename}.")
                 email_handler.add_label_to_email(gmail_service, message_id, current_processed_label)
-                email_handler.mark_email_as_read(gmail_service, message_id) 
+                email_handler.mark_email_as_read(gmail_service, message_id)
                 email_handler.remove_label_from_email(gmail_service, message_id, current_failed_label) # Remove fail label if it was there
             else:
                 failed_processing_count += 1
                 logging.error(f"Failed to process: {report_type} from Message ID: {message_id}, File: {original_filename}.")
                 email_handler.add_label_to_email(gmail_service, message_id, current_failed_label)
-        
+
         except Exception as e_proc:
             failed_processing_count += 1
             logging.error(f"Unhandled exception processing {report_type} (MsgID: {message_id}, File: {original_filename}): {e_proc}", exc_info=True)

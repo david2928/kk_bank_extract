@@ -2,7 +2,7 @@ import os.path
 import logging
 from googleapiclient.discovery import build
 from google.oauth2.service_account import Credentials
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 from googleapiclient.errors import HttpError
 from . import config
 
@@ -142,6 +142,61 @@ def find_file_id_by_name_in_folder(service, folder_id, filename):
     except Exception as e:
         logger.error(f"Unexpected error searching for file '{filename}' in folder {folder_id}: {e}", exc_info=True)
         return None
+
+def list_files_in_folder(service, folder_id):
+    """
+    Lists all (non-trashed) children of a Google Drive folder.
+    Returns a list of dicts with keys: id, name, mimeType. Empty list on error.
+    Pages through results so folders with >100 items are fully enumerated.
+    """
+    results = []
+    page_token = None
+    try:
+        while True:
+            query = f"'{folder_id}' in parents and trashed = false"
+            response = service.files().list(
+                q=query,
+                spaces='drive',
+                fields='nextPageToken, files(id, name, mimeType)',
+                pageSize=1000,
+                pageToken=page_token,
+            ).execute()
+            results.extend(response.get('files', []) or [])
+            page_token = response.get('nextPageToken')
+            if not page_token:
+                break
+        return results
+    except HttpError as error:
+        logger.error(f"HttpError listing folder {folder_id}: {error}")
+        return []
+    except Exception as e:
+        logger.error(f"Unexpected error listing folder {folder_id}: {e}", exc_info=True)
+        return []
+
+
+def download_file_to_local(service, file_id, local_path):
+    """
+    Downloads a Google Drive file by ID to a local path.
+    Returns True on success, False otherwise.
+    """
+    try:
+        request = service.files().get_media(fileId=file_id)
+        with open(local_path, 'wb') as fh:
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+                if status:
+                    logger.debug(f"Download {file_id}: {int(status.progress() * 100)}%")
+        logger.info(f"Successfully downloaded file ID {file_id} to {local_path}.")
+        return True
+    except HttpError as error:
+        logger.error(f"HttpError downloading file ID {file_id}: {error}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error downloading file ID {file_id}: {e}", exc_info=True)
+        return False
+
 
 def delete_file_by_id(service, file_id):
     """

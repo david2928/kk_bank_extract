@@ -155,6 +155,74 @@ def load_merchant_transaction_summaries(data_list: list):
 #         conflict_columns=conflict_cols
 #     )
 
+def get_ewallet_csv_summary(merchant_id: str, process_date: str):
+    """
+    Reads the EWALLET_CSV summary row for a given merchant + process_date.
+    Returns the row dict, or None if not found / DB unavailable.
+    """
+    client = get_supabase_client()
+    if not client:
+        return None
+    try:
+        table_query = client.schema(SUPABASE_SCHEMA).table("merchant_transaction_summaries") if SUPABASE_SCHEMA else client.table("merchant_transaction_summaries")
+        response = (
+            table_query
+            .select("*")
+            .eq("merchant_id", merchant_id)
+            .eq("process_date", process_date)
+            .eq("report_source_type", "EWALLET_CSV")
+            .execute()
+        )
+        rows = response.data or []
+        if not rows:
+            return None
+        if len(rows) > 1:
+            logging.warning(
+                f"Multiple EWALLET_CSV rows found for merchant_id={merchant_id} process_date={process_date}; using first."
+            )
+        return rows[0]
+    except Exception as e:
+        logging.error(
+            f"Exception reading ewallet_csv summary for merchant_id={merchant_id} process_date={process_date}: {e}",
+            exc_info=True,
+        )
+        return None
+
+
+def update_ewallet_csv_tax_invoice_no(merchant_id: str, process_date: str, tax_invoice_no: str) -> int:
+    """
+    UPDATEs the EWALLET_CSV summary row's tax_invoice_no.
+    Idempotent: only writes when the existing value is NULL.
+    Returns the number of rows updated (0 if no matching row, or row already has a value).
+    """
+    client = get_supabase_client()
+    if not client:
+        return 0
+    try:
+        table_query = client.schema(SUPABASE_SCHEMA).table("merchant_transaction_summaries") if SUPABASE_SCHEMA else client.table("merchant_transaction_summaries")
+        response = (
+            table_query
+            .update({"tax_invoice_no": tax_invoice_no})
+            .eq("merchant_id", merchant_id)
+            .eq("process_date", process_date)
+            .eq("report_source_type", "EWALLET_CSV")
+            .is_("tax_invoice_no", "null")
+            .execute()
+        )
+        rows_updated = len(response.data or [])
+        logging.info(
+            f"update_ewallet_csv_tax_invoice_no: merchant_id={merchant_id} process_date={process_date} "
+            f"tax_invoice_no={tax_invoice_no} rows_updated={rows_updated}"
+        )
+        return rows_updated
+    except Exception as e:
+        logging.error(
+            f"Exception updating tax_invoice_no for merchant_id={merchant_id} process_date={process_date}: {e}",
+            exc_info=True,
+        )
+        return 0
+
+
 if __name__ == '__main__':
     # Example Usage (Requires Supabase to be set up and .env file configured)
     logging.info("db_loader.py executed directly for testing.")
