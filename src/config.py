@@ -32,6 +32,9 @@ if not os.path.exists(DOWNLOAD_REPORTS_DIR):
 
 # Google Drive Configuration
 GDRIVE_ROOT_FOLDER_ID = os.getenv("GDRIVE_ROOT_FOLDER_ID", "1FQVq8tF-Wm4PHTzo8Ah5TRU7b69dsM7B") # Updated to the new folder ID
+# Optional: override the ShopeePay archive root. If unset, a "ShopeePay" folder is
+# auto-created under GDRIVE_ROOT_FOLDER_ID on first run.
+GDRIVE_SHOPEEPAY_ROOT_FOLDER_ID = os.getenv("GDRIVE_SHOPEEPAY_ROOT_FOLDER_ID")
 
 # Google Service Account Configuration
 GOOGLE_SERVICE_ACCOUNT_KEY_PATH_REL = os.getenv("GOOGLE_SERVICE_ACCOUNT_KEY_PATH", "service_account.json") # Relative to project root by default
