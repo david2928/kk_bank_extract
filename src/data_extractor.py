@@ -351,4 +351,117 @@ if __name__ == '__main__':
     # elif pdfplumber:
     #     print(f"Skipping PDF extraction test: {sample_pdf_path} not found. Please create it for testing.")
     # else:
-    #     print("Skipping PDF extraction test: pdfplumber library not installed.") 
+    #     print("Skipping PDF extraction test: pdfplumber library not installed.")
+
+
+# ---------------------------------------------------------------------------
+# ShopeePay daily settlement email parser (P4-SHOPEEPAY)
+# ---------------------------------------------------------------------------
+#
+# The email body is HTML-only with a two-table layout:
+#   Table 1 (header "สรุปยอดรายการโอนเงินให้ทางร้านค้า"): the main settlement.
+#   Table 2 (header "สรุปรายการที่ไม่ยังเรียกเก็บในยอดโอน"): "not yet collected"
+#     carry-forward; re-uses the same field labels — must NOT be parsed.
+#
+# After stripping HTML to text, each <td> becomes its own line, so a pattern of
+# the form `<thai-label>\s+<amount>` reliably extracts the value from the
+# adjacent cell. The two-section ambiguity is resolved by truncating the
+# parsed text at the second table's header before applying regexes.
+
+from html.parser import HTMLParser as _HTMLParser
+import html as _html_mod
+
+_SHOPEEPAY_NOT_COLLECTED_START = "สรุปรายการที่ไม่ยังเรียกเก็บในยอดโอน"
+_SHOPEEPAY_MAIN_SECTION_HEADER = "สรุปยอดรายการโอนเงินให้ทางร้านค้า"
+
+_AMOUNT_RE = r"(-?[\d,]+\.\d{2})"
+_SHOPEEPAY_PATTERNS = {
+    "gross_amount":            re.compile(r"ยอดเงินที่ต้องชำระ\s+" + _AMOUNT_RE),
+    "refund_amount":           re.compile(r"การคืนเงิน\s+" + _AMOUNT_RE),
+    "merchant_support_amount": re.compile(r"เงินสนับสนุนจากร้านค้า[^\n]*\s+" + _AMOUNT_RE),
+    "commission_amount":       re.compile(r"ค่าธรรมเนียม\s+" + _AMOUNT_RE),
+    "vat_on_commission":       re.compile(r"VAT\s+" + _AMOUNT_RE),
+    "wht_amount":              re.compile(r"WHT\s+" + _AMOUNT_RE),
+    "rollover_amount":         re.compile(r"ยอดยกมา\s+" + _AMOUNT_RE),
+    "net_amount":              re.compile(r"ยอดรวมที่โอนให้ร้านค้า\s+" + _AMOUNT_RE),
+}
+_SHOPEEPAY_BANK_TAIL = re.compile(r"เลขบัญชี:\*+(\d{4})")
+_SHOPEEPAY_DATE_RANGE = re.compile(
+    r"ประจำวันที่\s+(\d{4}-\d{2}-\d{2})\s*-\s*(\d{4}-\d{2}-\d{2})"
+)
+_SHOPEEPAY_SUBJECT_DATE = re.compile(r"\[(\d{4}-\d{2}-\d{2})\]\s*$")
+
+
+def _strip_html(html_text):
+    class _Stripper(_HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.buf = []
+        def handle_data(self, d):
+            self.buf.append(d)
+
+    s = _Stripper()
+    s.feed(html_text)
+    return _html_mod.unescape("\n".join(s.buf))
+
+
+def _to_float(s):
+    return float(s.replace(",", ""))
+
+
+def extract_shopeepay_settlement_body(body_text, subject=""):
+    """
+    Parse a ShopeePay daily-settlement email body. Returns dict on success, None on failure.
+
+    `body_text` may be either already-stripped plain text or raw HTML — both forms
+    are handled (HTML is detected by a leading '<' and stripped via html.parser).
+
+    Returned dict keys:
+        settlement_date (str, 'YYYY-MM-DD'), gross_amount, refund_amount,
+        merchant_support_amount, commission_amount, vat_on_commission,
+        wht_amount, rollover_amount, net_amount, bank_account_tail (4-digit str).
+
+    Only the main settlement section is parsed; the "not-yet-collected" second
+    section that repeats the same field labels is skipped.
+    """
+    if not body_text:
+        return None
+
+    text = _strip_html(body_text) if body_text.lstrip().startswith("<") else body_text
+    if _SHOPEEPAY_MAIN_SECTION_HEADER not in text:
+        return None
+
+    main_end = text.find(_SHOPEEPAY_NOT_COLLECTED_START)
+    section = text if main_end == -1 else text[:main_end]
+
+    parsed = {}
+    for key, pat in _SHOPEEPAY_PATTERNS.items():
+        m = pat.search(section)
+        if not m:
+            logging.warning(f"ShopeePay parser: pattern {key} not found")
+            return None
+        parsed[key] = _to_float(m.group(1))
+
+    tail_m = _SHOPEEPAY_BANK_TAIL.search(section)
+    if not tail_m:
+        logging.warning("ShopeePay parser: bank account tail not found")
+        return None
+    parsed["bank_account_tail"] = tail_m.group(1)
+
+    range_m = _SHOPEEPAY_DATE_RANGE.search(text)
+    if range_m:
+        start, end = range_m.group(1), range_m.group(2)
+        if start != end:
+            logging.warning(f"ShopeePay parser: unexpected multi-day range {start}..{end}")
+            return None
+        parsed["settlement_date"] = start
+    else:
+        subj_m = _SHOPEEPAY_SUBJECT_DATE.search(subject)
+        if not subj_m:
+            logging.warning("ShopeePay parser: no settlement date in body or subject")
+            return None
+        from datetime import timedelta
+        delivery = datetime.strptime(subj_m.group(1), "%Y-%m-%d")
+        parsed["settlement_date"] = (delivery - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    return parsed

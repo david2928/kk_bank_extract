@@ -223,6 +223,29 @@ def update_ewallet_csv_tax_invoice_no(merchant_id: str, process_date: str, tax_i
         return 0
 
 
+def load_shopeepay_settlements(data_list: list):
+    """
+    Idempotent upsert into finance.shopeepay_daily_settlements.
+
+    Conflict key: settlement_date (UNIQUE). A duplicate-resend email for the
+    same settlement_date is a no-op (values are identical); a correction email
+    would overwrite. The Gmail-label flow prevents reprocessing already-seen
+    message IDs, so this is invoked at most once per (settlement_date, message_id).
+    """
+    conflict_cols = ['settlement_date']
+    deduplicated = _deduplicate_records(data_list, conflict_cols)
+    if len(deduplicated) < len(data_list):
+        logging.warning(
+            f"Deduplicated {len(data_list) - len(deduplicated)} same-day records "
+            f"before loading shopeepay_daily_settlements."
+        )
+    return load_data_to_supabase(
+        table_name="shopeepay_daily_settlements",
+        data_list=deduplicated,
+        conflict_columns=conflict_cols,
+    )
+
+
 if __name__ == '__main__':
     # Example Usage (Requires Supabase to be set up and .env file configured)
     logging.info("db_loader.py executed directly for testing.")

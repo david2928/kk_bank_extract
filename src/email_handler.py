@@ -18,6 +18,9 @@ LABEL_PROCESSED = "KMERCHANT_PROCESSED"
 LABEL_FAILED = "KMERCHANT_PROCESSING_FAILED"
 LABEL_EWALLET_CSV_PROCESSED = "EWALLET_CSV_PROCESSED"
 LABEL_EWALLET_ETAX_PDF_PROCESSED = "EWALLET_ETAX_PDF_PROCESSED"
+LABEL_SHOPEEPAY_EMAIL_PROCESSED = "SHOPEEPAY_EMAIL_PROCESSED"
+LABEL_SHOPEEPAY_EMAIL_FAILED = "SHOPEEPAY_EMAIL_FAILED"
+LABEL_SHOPEEPAY_EMAIL_NEEDS_REVIEW = "SHOPEEPAY_EMAIL_NEEDS_REVIEW"
 
 # Default paths - these will be overridden by arguments in functions
 DEFAULT_CREDENTIALS_FILE = 'credentials.json'
@@ -241,6 +244,123 @@ def fetch_new_reports(service, search_query, download_to_dir, attachment_config)
 
     logger.info(f"Fetched {len(all_downloaded_files)} reports of type '{report_type}'.")
     return all_downloaded_files
+
+
+def _extract_message_bodies(payload):
+    """
+    Walk a Gmail message payload tree and return both the parser-friendly
+    stripped text and the original raw body. Preserving the raw body lets a
+    future parser change replay against the unaltered HTML rather than against
+    today's HTML-stripped approximation.
+
+    Returns dict with keys:
+        stripped: str  — text/plain if available, else HTML stripped to text via html.parser
+        raw:      str  — text/plain joined, else text/html joined (whichever was actually present)
+        kind:     str  — 'plain' | 'html' | 'empty'
+    """
+    from html.parser import HTMLParser
+    import html as html_mod
+
+    plain_parts = []
+    html_parts = []
+
+    def walk(part):
+        mime = part.get("mimeType", "")
+        data = part.get("body", {}).get("data")
+        if data:
+            try:
+                decoded = base64.urlsafe_b64decode(data.encode("ascii")).decode("utf-8", errors="replace")
+            except Exception:
+                decoded = ""
+            if mime == "text/plain":
+                plain_parts.append(decoded)
+            elif mime == "text/html":
+                html_parts.append(decoded)
+        for child in part.get("parts", []) or []:
+            walk(child)
+
+    walk(payload)
+
+    if plain_parts:
+        plain_text = "\n".join(plain_parts)
+        return {"stripped": plain_text, "raw": plain_text, "kind": "plain"}
+
+    if html_parts:
+        raw_html = "\n".join(html_parts)
+
+        class _Stripper(HTMLParser):
+            # Skip text nodes inside <script>/<style> — they're never user-visible
+            # and could confuse downstream regex if vendors inline analytics.
+            _SKIP_TAGS = frozenset({"script", "style"})
+
+            def __init__(self):
+                super().__init__()
+                self.buf = []
+                self.skip_depth = 0
+
+            def handle_starttag(self, tag, attrs):
+                if tag in self._SKIP_TAGS:
+                    self.skip_depth += 1
+
+            def handle_endtag(self, tag):
+                if tag in self._SKIP_TAGS and self.skip_depth:
+                    self.skip_depth -= 1
+
+            def handle_data(self, d):
+                if self.skip_depth == 0:
+                    self.buf.append(d)
+
+        s = _Stripper()
+        s.feed(raw_html)
+        stripped = html_mod.unescape("\n".join(s.buf))
+        return {"stripped": stripped, "raw": raw_html, "kind": "html"}
+
+    return {"stripped": "", "raw": "", "kind": "empty"}
+
+
+def _extract_plaintext_from_payload(payload):
+    """Back-compat thin wrapper — returns just the stripped text."""
+    return _extract_message_bodies(payload)["stripped"]
+
+
+def fetch_new_body_only_reports(service, search_query, processed_label):
+    """
+    Fetch Gmail messages matching `search_query` that don't yet carry `processed_label`.
+    Returns: list of dicts with keys: message_id, subject, date_header, body_text,
+    processed_label, report_type. No attachments are downloaded.
+
+    Used by body-only ingestion paths (e.g. ShopeePay daily settlement emails).
+    """
+    final_query = f"{search_query} -label:{processed_label}"
+    messages = search_emails(service, final_query)
+    results = []
+    if not messages:
+        logger.info(f"No new body-only messages matching: {final_query}")
+        return results
+
+    for m in messages:
+        message_id = m["id"]
+        try:
+            full = service.users().messages().get(userId="me", id=message_id, format="full").execute()
+        except HttpError as error:
+            logger.error(f"Failed to fetch full message {message_id}: {error}")
+            continue
+        headers = {h["name"]: h["value"] for h in full["payload"].get("headers", [])}
+        bodies = _extract_message_bodies(full["payload"])
+        results.append({
+            "message_id": message_id,
+            "subject": headers.get("Subject", ""),
+            "date_header": headers.get("Date", ""),
+            "body_text": bodies["stripped"],   # parser-friendly
+            "body_raw": bodies["raw"],          # original HTML/plain — persisted for audit
+            "body_kind": bodies["kind"],        # 'plain' | 'html' | 'empty'
+            "processed_label": processed_label,
+            "report_type": "BODY_ONLY",
+        })
+
+    logger.info(f"Fetched {len(results)} body-only messages for query: {search_query}")
+    return results
+
 
 if __name__ == '__main__':
     # --- Configuration for standalone testing ---

@@ -79,4 +79,42 @@ This document tracks the tasks for the KBank Report Processing application.
     *   **Status:** To Do
 *   **P3-TASK-008 (Documentation Update):**
     *   **Description:** Update `README.md` and any other relevant documentation to reflect the new eWallet report handling capabilities.
-    *   **Status:** To Do 
+    *   **Status:** To Do
+
+## Epic: P4-SHOPEEPAY - ShopeePay Daily Settlement Email Integration
+
+ShopeePay (payment-link aggregator) sends a daily Thai-language HTML email from
+`support_th@shopeepay.com` summarising the previous day's gross / commission /
+VAT / WHT / net for settlement to KBank Savings 170-3-27029-4 on T+1. This
+pipeline ingests those emails into `finance.shopeepay_daily_settlements`.
+Empirical formula: `net = gross - refund + merchant_support - commission - vat`
+(WHT is informational only — NOT subtracted from the deposit).
+
+*   **P4-TASK-001 (Analyze ShopeePay emails):**
+    *   **Description:** Read-only probe of `support_th@shopeepay.com` since 2026-04-01 to confirm cadence, format, attachments-vs-body, second-section ambiguity, and duplicate-resend behaviour.
+    *   **Findings:** 8 emails / 7 distinct settlement dates (one duplicate-resend on 2026-04-30, identical content, 13 min apart). All HTML-only (no `text/plain`, no attachments). Subject pattern `[LENGOLF...] รายงานการโอนเงินสำหรับ ShopeePay Payment [YYYY-MM-DD]` (delivery date). Bank tail `******0294` literal in all. WHT is shown but NOT subtracted from the deposit (contradicts initial spec).
+    *   **Status:** Done
+*   **P4-TASK-002 (Supabase schema):**
+    *   **Description:** Create `finance.shopeepay_daily_settlements` with `UNIQUE(settlement_date)` so duplicate-resend emails upsert into the same row.
+    *   **Migration:** `migrations/2026-05-15_shopeepay_daily_settlements.sql`
+    *   **Status:** Done
+*   **P4-TASK-003 (Email handler — body-only fetcher):**
+    *   **Description:** Add `LABEL_SHOPEEPAY_EMAIL_PROCESSED` / `LABEL_SHOPEEPAY_EMAIL_FAILED`. Add `fetch_new_body_only_reports(service, search_query, processed_label)` which returns decoded `body_text` (HTML stripped to text) + `message_id` without downloading attachments. No changes to the existing attachment-based `fetch_new_reports`.
+    *   **Status:** Done
+*   **P4-TASK-004 (Parser):**
+    *   **Description:** Add `extract_shopeepay_settlement_body(body_text, subject)` to `src/data_extractor.py`. Accepts HTML or already-stripped text. Truncates at the "not-yet-collected" second-table header before applying regex so the same field labels in the second section can't poison the result. Settlement date derived from `ประจำวันที่ X - X` in body, with subject-date fallback (`[YYYY-MM-DD]` minus one day).
+    *   **Tests:** `tests/test_shopeepay_parser.py` (5 tests).
+    *   **Status:** Done
+*   **P4-TASK-005 (Loader):**
+    *   **Description:** Add `load_shopeepay_settlements(data_list)` to `src/db_loader.py`. Upsert with `on_conflict='settlement_date'`.
+    *   **Status:** Done
+*   **P4-TASK-006 (Main wire-up):**
+    *   **Description:** Add `process_shopeepay_email(report_info, gdrive_service, supabase_client)`. Archives the raw HTML body to Drive under `<root>/ShopeePay/YYYY/YYYYMM/YYYY-MM-DD/shopeepay-settlement-YYYY-MM-DD.txt` (root override via `GDRIVE_SHOPEEPAY_ROOT_FOLDER_ID` env, else auto-creates a `ShopeePay` sibling under `GDRIVE_ROOT_FOLDER_ID`). Dispatcher block added in `main()` after the attachment-based loop; the early-return-when-empty was relaxed so body-only paths still run.
+    *   **Status:** Done
+*   **P4-TASK-007 (Backfill + validate):**
+    *   **Description:** Full backfill via `python -m src.main`. Confirm all 6 known ShopeePay deposits (2026-04-16 → 2026-05-09) reconcile to a settlement row's `net_amount` with `gap = 0`.
+    *   **Result:** 8 emails fetched → 7 rows (duplicate-resend collapsed); all 6 known deposits verified with `gap = 0.00`. Re-running yields 0 fetched (Gmail label idempotency).
+    *   **Status:** Done
+*   **P4-TASK-008 (Documentation):**
+    *   **Description:** Update `README.md` Features list to mention ShopeePay daily settlement emails.
+    *   **Status:** Done

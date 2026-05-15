@@ -14,9 +14,14 @@ import csv # Added for CSV parsing
 # Import the config module itself
 from src import config 
 from src.zip_processor import extract_zip
-from src.data_extractor import extract_csv_data, extract_ewallet_etax_pdf_data # Removed extract_pdf_data
+from src.data_extractor import (
+    extract_csv_data,
+    extract_ewallet_etax_pdf_data,
+    extract_shopeepay_settlement_body,
+)
 from src.db_loader import (
     load_merchant_transaction_summaries,
+    load_shopeepay_settlements,
     get_supabase_client,
     get_ewallet_csv_summary,
     update_ewallet_csv_tax_invoice_no,
@@ -575,6 +580,188 @@ def process_ewallet_etax_pdf(report_info, gdrive_service, supabase_client):
         logger.error(f"ERROR processing EWALLET_ETAX_PDF file {original_filename} (path: {pdf_path}): {e}", exc_info=True)
         return "FAILED"
 
+SHOPEEPAY_EXPECTED_BANK_TAIL = "0294"  # KBank Savings 170-3-27029-4
+
+
+def process_shopeepay_email(report_info, gdrive_service, supabase_client):
+    """
+    Process a single ShopeePay daily-settlement email (body-only, HTML).
+
+    Tri-state return (matches the EWALLET_ETAX pattern):
+        "PROCESSED"     — fully done; caller applies SHOPEEPAY_EMAIL_PROCESSED
+        "NEEDS_REVIEW"  — parsed successfully but a sanity check (bank tail / net
+                          equation) flagged the row; caller applies
+                          SHOPEEPAY_EMAIL_NEEDS_REVIEW (a row is still written
+                          when the parser produced one — see logic below)
+        "FAILED"        — parser broke or DB/Drive errored; caller applies
+                          SHOPEEPAY_EMAIL_FAILED so the next run retries
+
+    Idempotency: ordering is DB-upsert first → Drive archive → DB update with
+    gdrive_file_id. The DB upsert is keyed on UNIQUE(settlement_date) so
+    duplicate-resend emails collapse. The Drive upload is skipped when a row
+    already has a non-null gdrive_file_id (handles the failure window where a
+    prior run loaded to DB but couldn't upload to Drive — next run picks up
+    where it left off without re-uploading on the happy path).
+    """
+    message_id = report_info.get("message_id")
+    subject = report_info.get("subject", "")
+    body_text = report_info.get("body_text", "")           # parser-ready
+    body_raw = report_info.get("body_raw") or body_text     # archival; original HTML when available
+
+    parsed = extract_shopeepay_settlement_body(body_text, subject=subject)
+    if not parsed:
+        logger.error(f"ShopeePay parser returned None for message_id={message_id}")
+        return "FAILED"
+
+    outcome = "PROCESSED"
+
+    # Bank tail check — a legitimate change-of-account notification is not a
+    # parsing failure; flag for manual review so the row is still ingested but
+    # someone can investigate.
+    if parsed["bank_account_tail"] != SHOPEEPAY_EXPECTED_BANK_TAIL:
+        logger.warning(
+            f"ShopeePay {message_id}: unexpected bank tail "
+            f"{parsed['bank_account_tail']} (expected {SHOPEEPAY_EXPECTED_BANK_TAIL}) — needs review"
+        )
+        outcome = "NEEDS_REVIEW"
+
+    # Empirical net equation check: net = gross - refund + support - commission - vat + rollover.
+    # WHT is informational and is NOT subtracted from the deposit.
+    derived_net = (
+        parsed["gross_amount"]
+        - parsed["refund_amount"]
+        + parsed["merchant_support_amount"]
+        - parsed["commission_amount"]
+        - parsed["vat_on_commission"]
+        + parsed["rollover_amount"]
+    )
+    if abs(derived_net - parsed["net_amount"]) > 0.01:
+        logger.warning(
+            f"ShopeePay {message_id}: net equation mismatch "
+            f"derived={derived_net:.2f} reported={parsed['net_amount']:.2f} "
+            f"(possible vendor formula change) — needs review"
+        )
+        outcome = "NEEDS_REVIEW"
+
+    if not supabase_client:
+        logger.error(f"Supabase client unavailable — cannot load ShopeePay email {message_id}")
+        return "FAILED"
+
+    # Step 1: read any existing row for this settlement_date to recover gdrive_file_id
+    # set by an earlier (partially-successful) run.
+    sb = supabase_client
+    try:
+        table_query = (
+            sb.schema(config.SUPABASE_SCHEMA).table("shopeepay_daily_settlements")
+            if config.SUPABASE_SCHEMA
+            else sb.table("shopeepay_daily_settlements")
+        )
+        existing = (
+            table_query.select("gdrive_file_id")
+            .eq("settlement_date", parsed["settlement_date"])
+            .execute()
+        )
+        existing_gdrive_file_id = (existing.data or [{}])[0].get("gdrive_file_id") if existing.data else None
+    except Exception as e:
+        logger.error(
+            f"ShopeePay {message_id}: failed to read existing row: {e}",
+            exc_info=True,
+        )
+        return "FAILED"
+
+    # Step 2: upsert row. Don't clobber an existing gdrive_file_id with NULL —
+    # carry it forward if we already archived in a prior run.
+    record = {
+        "settlement_date":         parsed["settlement_date"],
+        "gross_amount":            parsed["gross_amount"],
+        "refund_amount":           parsed["refund_amount"],
+        "merchant_support_amount": parsed["merchant_support_amount"],
+        "commission_amount":       parsed["commission_amount"],
+        "vat_on_commission":       parsed["vat_on_commission"],
+        "wht_amount":              parsed["wht_amount"],
+        "rollover_amount":         parsed["rollover_amount"],
+        "net_amount":              parsed["net_amount"],
+        "bank_account_tail":       parsed["bank_account_tail"],
+        "source_message_id":       message_id,
+        "gdrive_file_id":          existing_gdrive_file_id,
+        "raw_body":                body_raw,
+        # `updated_at` deliberately omitted — DB default `now()` is used.
+    }
+    success, failure = load_shopeepay_settlements([record])
+    if failure > 0 or success == 0:
+        logger.error(
+            f"ShopeePay {message_id}: load failed (success={success} failure={failure})"
+        )
+        return "FAILED"
+
+    # Step 3: archive to Drive ONLY if not already done. Drive failure is
+    # non-fatal — the row is in the DB; next run will pick up the missing
+    # gdrive_file_id and retry the upload.
+    if existing_gdrive_file_id:
+        logger.info(
+            f"ShopeePay {message_id}: settlement_date={parsed['settlement_date']} "
+            f"already archived (gdrive_file_id={existing_gdrive_file_id}) — skipping upload"
+        )
+    elif not gdrive_service:
+        logger.warning(
+            f"ShopeePay {message_id}: GDrive service unavailable — DB row written without archive"
+        )
+    else:
+        try:
+            root_folder_id = config.GDRIVE_SHOPEEPAY_ROOT_FOLDER_ID or gdrive_handler.find_or_create_folder(
+                gdrive_service, config.GDRIVE_ROOT_FOLDER_ID, "ShopeePay"
+            )
+            day_folder_id = _ensure_gdrive_folder_structure(
+                gdrive_service, parsed["settlement_date"], root_folder_id
+            )
+            if not day_folder_id:
+                logger.error(f"ShopeePay {message_id}: could not create Drive day folder")
+                return outcome  # DB succeeded; treat as soft success
+
+            ext = "html" if report_info.get("body_kind") == "html" else "txt"
+            local_file = None
+            try:
+                fd, local_file = tempfile.mkstemp(
+                    prefix=f"shopeepay-settlement-{parsed['settlement_date']}-",
+                    suffix=f".{ext}",
+                )
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(body_raw if body_raw else body_text)
+                gdrive_file_id = gdrive_handler.upload_file_to_gdrive(
+                    gdrive_service,
+                    local_file,
+                    day_folder_id,
+                    remote_filename=f"shopeepay-settlement-{parsed['settlement_date']}.{ext}",
+                )
+            finally:
+                if local_file and os.path.exists(local_file):
+                    os.remove(local_file)
+
+            if gdrive_file_id:
+                # Patch the row with the freshly-uploaded gdrive_file_id.
+                try:
+                    table_query.update({"gdrive_file_id": gdrive_file_id}).eq(
+                        "settlement_date", parsed["settlement_date"]
+                    ).execute()
+                except Exception as e:
+                    logger.warning(
+                        f"ShopeePay {message_id}: failed to patch gdrive_file_id: {e}"
+                    )
+            else:
+                logger.warning(f"ShopeePay {message_id}: Drive upload returned no file_id")
+        except Exception as e:
+            logger.warning(
+                f"ShopeePay {message_id}: Drive archive failed (non-fatal): {e}",
+                exc_info=True,
+            )
+
+    logger.info(
+        f"ShopeePay {outcome}: settlement_date={parsed['settlement_date']} "
+        f"net={parsed['net_amount']} message_id={message_id}"
+    )
+    return outcome
+
+
 def main():
     logging.info("Starting K-Merchant Email Report Processing System...")
 
@@ -650,8 +837,7 @@ def main():
 
 
     if not all_fetched_reports:
-        logging.info("No new reports of any type found or downloaded. Exiting.")
-        return
+        logging.info("No new attachment-based reports found; continuing to body-only paths.")
 
     logging.info(f"Fetched a total of {len(all_fetched_reports)} new report item(s) across all types.")
     successful_processing_count = 0
@@ -727,10 +913,74 @@ def main():
         except OSError as e_del:
             logging.error(f"Error deleting file {downloaded_file_path}: {e_del}")
 
+    # --- P4-SHOPEEPAY: body-only ShopeePay daily settlement emails ---
+    # These have no attachments and live in HTML body, so they use a separate
+    # fetch path and a separate processing loop.
+    SHOPEEPAY_EMAIL_CONFIG = {
+        "search_query":    "from:support_th@shopeepay.com",
+        "processed_label": email_handler.LABEL_SHOPEEPAY_EMAIL_PROCESSED,
+        "failed_label":    email_handler.LABEL_SHOPEEPAY_EMAIL_FAILED,
+    }
+    try:
+        shopeepay_items = email_handler.fetch_new_body_only_reports(
+            gmail_service,
+            SHOPEEPAY_EMAIL_CONFIG["search_query"],
+            SHOPEEPAY_EMAIL_CONFIG["processed_label"],
+        )
+    except Exception as e_fetch_sp:
+        logging.error(f"Error fetching ShopeePay emails: {e_fetch_sp}", exc_info=True)
+        shopeepay_items = []
+
+    shopeepay_success = 0
+    shopeepay_needs_review = 0
+    shopeepay_failure = 0
+    for ri in shopeepay_items:
+        sp_msg_id = ri.get("message_id")
+        try:
+            outcome = process_shopeepay_email(ri, gdrive_service, supabase_client)
+        except Exception as e_proc_sp:
+            logger.error(
+                f"Unhandled exception processing ShopeePay email {sp_msg_id}: {e_proc_sp}",
+                exc_info=True,
+            )
+            outcome = "FAILED"
+        if outcome == "PROCESSED":
+            shopeepay_success += 1
+            email_handler.add_label_to_email(
+                gmail_service, sp_msg_id, SHOPEEPAY_EMAIL_CONFIG["processed_label"]
+            )
+            email_handler.mark_email_as_read(gmail_service, sp_msg_id)
+            email_handler.remove_label_from_email(
+                gmail_service, sp_msg_id, SHOPEEPAY_EMAIL_CONFIG["failed_label"]
+            )
+            email_handler.remove_label_from_email(
+                gmail_service, sp_msg_id, email_handler.LABEL_SHOPEEPAY_EMAIL_NEEDS_REVIEW
+            )
+        elif outcome == "NEEDS_REVIEW":
+            # Row was still ingested; flag for human follow-up. Also stop
+            # re-fetching via the PROCESSED label since the data is in the DB.
+            shopeepay_needs_review += 1
+            email_handler.add_label_to_email(
+                gmail_service, sp_msg_id, email_handler.LABEL_SHOPEEPAY_EMAIL_NEEDS_REVIEW
+            )
+            email_handler.add_label_to_email(
+                gmail_service, sp_msg_id, SHOPEEPAY_EMAIL_CONFIG["processed_label"]
+            )
+        else:  # "FAILED"
+            shopeepay_failure += 1
+            email_handler.add_label_to_email(
+                gmail_service, sp_msg_id, SHOPEEPAY_EMAIL_CONFIG["failed_label"]
+            )
+
     logging.info("\n--- Processing Summary ---")
     logging.info(f"Total reports processed: {len(all_fetched_reports)}")
     logging.info(f"Successfully processed reports: {successful_processing_count}")
     logging.info(f"Failed to process reports: {failed_processing_count}")
+    logger.info(
+        f"ShopeePay emails: {len(shopeepay_items)} fetched, "
+        f"{shopeepay_success} succeeded, {shopeepay_needs_review} needs-review, "
+        f"{shopeepay_failure} failed."
+    )
 
 if __name__ == '__main__':
     main() 

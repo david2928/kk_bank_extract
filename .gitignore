@@ -23,6 +23,10 @@ service_account.json
 # Downloaded files
 downloaded_reports/
 
+# Local probe outputs (ShopeePay Step 1 investigation; not committed)
+shopeepay_raw/
+shopeepay_probe.txt
+
 # Output files / logs (if any specific ones are generated and not needed in repo)
 # *.log
 
