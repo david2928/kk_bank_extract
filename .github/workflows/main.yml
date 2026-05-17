@@ -5,7 +5,20 @@ on:
     branches: [ main ] # Triggers on push to the main branch
   workflow_dispatch: # Allows manual triggering from the Actions tab
   schedule:
-    - cron: '0 0 * * *'  # Every day at 00:00 UTC (7:00am Thailand time)
+    # Two daily runs aligned to the ShopeePay email arrival pattern.
+    # Note: GitHub Actions cron typically delays ~3-4h on hour boundaries due
+    # to scheduler load, so the nominal UTC times below fire later in practice.
+    #
+    # Morning catch: ShopeePay normally sends the daily settlement email at
+    # ~23:25 UTC (= 06:25 Thailand). This nominal-00:00-UTC cron fires around
+    # 04:00 UTC = 11:00 Thailand in practice, so each day's email is ingested
+    # ~4-5h after it arrives.
+    - cron: '0 0 * * *'
+    # Afternoon catch: holiday-delayed deliveries (observed 2026-05-01 at
+    # 14:09 UTC = 21:09 Thailand) would otherwise wait for next morning's cron.
+    # This nominal-15:00-UTC cron fires around 18:00-19:00 UTC = 01:00-02:00
+    # Thailand, catching same-day late deliveries.
+    - cron: '0 15 * * *'
 
 permissions:
   contents: write
